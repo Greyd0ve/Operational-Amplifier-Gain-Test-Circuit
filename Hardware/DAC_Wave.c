@@ -18,10 +18,12 @@ static float DACWave_LimitFloat(float value, float min, float max)
     {
         return min;
     }
+
     if (value > max)
     {
         return max;
     }
+
     return value;
 }
 
@@ -31,10 +33,12 @@ static uint32_t DACWave_LimitFreq(uint32_t freq_hz)
     {
         return FREQ_MIN_HZ;
     }
+
     if (freq_hz > FREQ_MAX_HZ)
     {
         return FREQ_MAX_HZ;
     }
+
     return freq_hz;
 }
 
@@ -67,34 +71,50 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
     uint8_t was_running;
 
     dac_update_rate = freq_hz * WAVE_TABLE_SIZE;
+
     if (dac_update_rate == 0)
     {
         dac_update_rate = 1;
     }
 
+    /*
+     * STM32F103RCT6 常见配置：
+     * SYSCLK = 72MHz
+     * APB1 = 36MHz
+     * TIM6 时钟 = 72MHz
+     *
+     * DAC 更新频率 = 输出频率 * 波表点数
+     */
     arr_reload = SYSCLK_HZ / dac_update_rate;
+
     if (arr_reload < 2)
     {
         arr_reload = 2;
     }
 
     prescaler_div = 1;
+
     if (arr_reload > 65536UL)
     {
         prescaler_div = (arr_reload + 65535UL) / 65536UL;
+
         if (prescaler_div < 1)
         {
             prescaler_div = 1;
         }
+
         if (prescaler_div > 65536UL)
         {
             prescaler_div = 65536UL;
         }
+
         arr_reload = SYSCLK_HZ / (dac_update_rate * prescaler_div);
+
         if (arr_reload < 2)
         {
             arr_reload = 2;
         }
+
         if (arr_reload > 65536UL)
         {
             arr_reload = 65536UL;
@@ -102,6 +122,7 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
     }
 
     was_running = DACWave_Running;
+
     if (was_running)
     {
         TIM_Cmd(TIM6, DISABLE);
@@ -112,7 +133,10 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
     TIM_TimeBaseInit(TIM6, &TIM_TimeBaseStructure);
+
     TIM_SelectOutputTrigger(TIM6, TIM_TRGOSource_Update);
+    TIM_SetCounter(TIM6, 0);
+    TIM_ClearFlag(TIM6, TIM_FLAG_Update);
 
     if (was_running)
     {
@@ -130,6 +154,15 @@ void DACWave_UpdateTable(void)
     int32_t code;
     uint8_t was_running;
 
+    /*
+     * 100mVrms 正弦波：
+     * Vp = 0.1 * sqrt(2) = 0.141V
+     * amp_code = Vp / 3.3 * 4095 ≈ 175
+     *
+     * PA4 原始 DAC 输出应为：
+     * 1.65V ± 0.141V
+     * Vpp ≈ 282mV
+     */
     base_amp_code = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
     amp_code = base_amp_code * DACWave_AmpScale;
 
@@ -137,12 +170,14 @@ void DACWave_UpdateTable(void)
     {
         amp_code = (float)(DAC_MID_CODE - 1);
     }
+
     if (amp_code < 0.0f)
     {
         amp_code = 0.0f;
     }
 
     was_running = DACWave_Running;
+
     if (was_running)
     {
         TIM_Cmd(TIM6, DISABLE);
@@ -166,6 +201,7 @@ void DACWave_UpdateTable(void)
         {
             code = 0;
         }
+
         if (code > DAC_MAX_CODE)
         {
             code = DAC_MAX_CODE;
@@ -188,8 +224,15 @@ void DACWave_Init(void)
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_DAC | RCC_APB1Periph_TIM6, ENABLE);
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
 
+    /*
+     * STM32F103RCT6 / 高密度 F103：
+     * DAC Channel1 对应 DMA2_Channel3
+     * 所以这里必须开启 DMA2 时钟。
+     */
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
+
+    /* PA4 -> DAC_OUT1，配置为模拟输入模式 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
@@ -198,9 +241,17 @@ void DACWave_Init(void)
     DACWave_FreqHz = FREQ_MIN_HZ;
     DACWave_AmpScale = AMP_SCALE_INIT;
     DACWave_Waveform = WAVEFORM_SINE;
+    DACWave_Running = 0;
+
     DACWave_UpdateTable();
 
-    DMA_DeInit(DMA1_Channel3);
+    /*
+     * DAC Channel1 使用 DMA2_Channel3。
+     * 注意：
+     * 如果这里误用 DMA1_Channel3，PA4 很可能只输出固定电压，
+     * 不会有连续正弦波。
+     */
+    DMA_DeInit(DMA2_Channel3);
     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&DAC->DHR12R1;
     DMA_InitStructure.DMA_MemoryBaseAddr = (uint32_t)DACWave_Table;
     DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralDST;
@@ -212,7 +263,7 @@ void DACWave_Init(void)
     DMA_InitStructure.DMA_Mode = DMA_Mode_Circular;
     DMA_InitStructure.DMA_Priority = DMA_Priority_High;
     DMA_InitStructure.DMA_M2M = DMA_M2M_Disable;
-    DMA_Init(DMA1_Channel3, &DMA_InitStructure);
+    DMA_Init(DMA2_Channel3, &DMA_InitStructure);
 
     DAC_InitStructure.DAC_Trigger = DAC_Trigger_T6_TRGO;
     DAC_InitStructure.DAC_WaveGeneration = DAC_WaveGeneration_None;
@@ -228,11 +279,19 @@ void DACWave_Init(void)
 
 void DACWave_Start(void)
 {
-    DMA_Cmd(DMA1_Channel3, DISABLE);
-    DMA_SetCurrDataCounter(DMA1_Channel3, WAVE_TABLE_SIZE);
-    DMA_Cmd(DMA1_Channel3, ENABLE);
+    TIM_Cmd(TIM6, DISABLE);
+
+    DMA_Cmd(DMA2_Channel3, DISABLE);
+    DMA_SetCurrDataCounter(DMA2_Channel3, WAVE_TABLE_SIZE);
+    DMA_ClearFlag(DMA2_FLAG_GL3 | DMA2_FLAG_TC3 | DMA2_FLAG_HT3 | DMA2_FLAG_TE3);
+    DMA_Cmd(DMA2_Channel3, ENABLE);
+
     DAC_DMACmd(DAC_Channel_1, ENABLE);
+
+    TIM_SetCounter(TIM6, 0);
+    TIM_ClearFlag(TIM6, TIM_FLAG_Update);
     TIM_Cmd(TIM6, ENABLE);
+
     DACWave_Running = 1;
 }
 
@@ -240,8 +299,10 @@ void DACWave_Stop(void)
 {
     TIM_Cmd(TIM6, DISABLE);
     DAC_DMACmd(DAC_Channel_1, DISABLE);
-    DMA_Cmd(DMA1_Channel3, DISABLE);
+    DMA_Cmd(DMA2_Channel3, DISABLE);
+
     DAC_SetChannel1Data(DAC_Align_12b_R, DAC_MID_CODE);
+
     DACWave_Running = 0;
 }
 
@@ -273,6 +334,7 @@ void DACWave_SetWaveform(Waveform_t waveform)
     {
         waveform = WAVEFORM_SINE;
     }
+
     DACWave_Waveform = waveform;
     DACWave_UpdateTable();
 }
