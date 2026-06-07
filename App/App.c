@@ -21,10 +21,12 @@ static uint32_t App_LimitFreq(uint32_t freq)
     {
         return FREQ_MIN_HZ;
     }
+
     if (freq > FREQ_MAX_HZ)
     {
         return FREQ_MAX_HZ;
     }
+
     return freq;
 }
 
@@ -130,6 +132,7 @@ static void App_DisplayMain(void)
 
     OLED_ShowString(1, 3, "F:");
     OLED_ShowNum(1, 5, DACWave_GetFreq(), 4);
+
     OLED_ShowString(1, 9, " A:");
     if (AutoGain_IsEnabled())
     {
@@ -227,11 +230,14 @@ void App_Run(void)
 {
     KeyEvent_t event;
     float amp;
+    float old_amp;
+    float diff;
 
     Delay_ms(KEY_SCAN_PERIOD_MS);
 
     Key_Scan10ms();
     event = Key_GetEvent();
+
     if (event != KEY_EVENT_NONE)
     {
         App_HandleKey(event);
@@ -246,8 +252,23 @@ void App_Run(void)
 
         if (AutoGain_IsEnabled())
         {
-            amp = AutoGain_Update(App_Result.uo_rms, App_Result.clip, DACWave_GetAmplitudeScale());
-            DACWave_SetAmplitudeScale(amp);
+            old_amp = DACWave_GetAmplitudeScale();
+            amp = AutoGain_Update(App_Result.uo_rms, App_Result.clip, old_amp);
+
+            diff = amp - old_amp;
+            if (diff < 0.0f)
+            {
+                diff = -diff;
+            }
+
+            /*
+             * 只有幅度变化明显时才更新 DAC 表。
+             * 避免自动调幅稳定后仍反复调用 DACWave_SetAmplitudeScale。
+             */
+            if (diff > 0.001f)
+            {
+                DACWave_SetAmplitudeScale(amp);
+            }
         }
     }
 

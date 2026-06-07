@@ -5,8 +5,11 @@
 
 #define DAC_TWO_PI              6.283185307f
 #define DAC_SQRT2               1.414213562f
+#define DAC_NORM_MAX            32767
 
 static uint16_t DACWave_Table[WAVE_TABLE_SIZE];
+static int16_t DACWave_NormTable[WAVE_TABLE_SIZE];
+
 static uint32_t DACWave_FreqHz = FREQ_MIN_HZ;
 static float DACWave_AmpScale = AMP_SCALE_INIT;
 static Waveform_t DACWave_Waveform = WAVEFORM_SINE;
@@ -59,6 +62,44 @@ static float DACWave_GetTriangleSample(uint16_t index)
     else
     {
         return pos * 4.0f - 4.0f;
+    }
+}
+
+/**
+ * @brief  生成归一化波形表
+ * @note   范围约为 -32767 ~ +32767
+ *         只在初始化或切换波形时调用，不在自动调幅时反复调用 sinf
+ */
+static void DACWave_UpdateNormTable(void)
+{
+    uint16_t i;
+    float sample;
+    int32_t value;
+
+    for (i = 0; i < WAVE_TABLE_SIZE; i++)
+    {
+        if (DACWave_Waveform == WAVEFORM_TRIANGLE)
+        {
+            sample = DACWave_GetTriangleSample(i);
+        }
+        else
+        {
+            sample = sinf(DAC_TWO_PI * (float)i / (float)WAVE_TABLE_SIZE);
+        }
+
+        value = (int32_t)(sample * (float)DAC_NORM_MAX);
+
+        if (value > DAC_NORM_MAX)
+        {
+            value = DAC_NORM_MAX;
+        }
+
+        if (value < -DAC_NORM_MAX)
+        {
+            value = -DAC_NORM_MAX;
+        }
+
+        DACWave_NormTable[i] = (int16_t)value;
     }
 }
 
@@ -144,15 +185,19 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
     }
 }
 
+/**
+ * @brief  根据当前幅度系数重新生成 DAC 输出表
+ * @note   这个函数不再关闭 TIM6。
+ *         这样自动调幅时不会出现明显直线段。
+ *         代价是表更新瞬间可能有极轻微幅值过渡，但通常比暂停波形更好。
+ */
 void DACWave_UpdateTable(void)
 {
     uint16_t i;
-    float base_amp_code;
-    float amp_code;
-    float sample;
-    float code_f;
+    float base_amp_code_f;
+    float amp_code_f;
+    int32_t amp_code;
     int32_t code;
-    uint8_t was_running;
 
     /*
      * 100mVrms 正弦波：
@@ -163,39 +208,25 @@ void DACWave_UpdateTable(void)
      * 1.65V ± 0.141V
      * Vpp ≈ 282mV
      */
-    base_amp_code = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
-    amp_code = base_amp_code * DACWave_AmpScale;
+    base_amp_code_f = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
+    amp_code_f = base_amp_code_f * DACWave_AmpScale;
 
-    if (amp_code > (float)(DAC_MID_CODE - 1))
+    if (amp_code_f > (float)(DAC_MID_CODE - 1))
     {
-        amp_code = (float)(DAC_MID_CODE - 1);
+        amp_code_f = (float)(DAC_MID_CODE - 1);
     }
 
-    if (amp_code < 0.0f)
+    if (amp_code_f < 0.0f)
     {
-        amp_code = 0.0f;
+        amp_code_f = 0.0f;
     }
 
-    was_running = DACWave_Running;
-
-    if (was_running)
-    {
-        TIM_Cmd(TIM6, DISABLE);
-    }
+    amp_code = (int32_t)(amp_code_f + 0.5f);
 
     for (i = 0; i < WAVE_TABLE_SIZE; i++)
     {
-        if (DACWave_Waveform == WAVEFORM_TRIANGLE)
-        {
-            sample = DACWave_GetTriangleSample(i);
-        }
-        else
-        {
-            sample = sinf(DAC_TWO_PI * (float)i / (float)WAVE_TABLE_SIZE);
-        }
-
-        code_f = (float)DAC_MID_CODE + amp_code * sample;
-        code = (int32_t)(code_f + 0.5f);
+        code = (int32_t)DAC_MID_CODE;
+        code += (amp_code * (int32_t)DACWave_NormTable[i]) / DAC_NORM_MAX;
 
         if (code < 0)
         {
@@ -208,11 +239,6 @@ void DACWave_UpdateTable(void)
         }
 
         DACWave_Table[i] = (uint16_t)code;
-    }
-
-    if (was_running)
-    {
-        TIM_Cmd(TIM6, ENABLE);
     }
 }
 
@@ -228,11 +254,10 @@ void DACWave_Init(void)
     /*
      * STM32F103RCT6 / 高密度 F103：
      * DAC Channel1 对应 DMA2_Channel3
-     * 所以这里必须开启 DMA2 时钟。
      */
     RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
 
-    /* PA4 -> DAC_OUT1，配置为模拟输入模式 */
+    /* PA4 -> DAC_OUT1，配置为模拟模式 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
@@ -243,13 +268,11 @@ void DACWave_Init(void)
     DACWave_Waveform = WAVEFORM_SINE;
     DACWave_Running = 0;
 
+    DACWave_UpdateNormTable();
     DACWave_UpdateTable();
 
     /*
      * DAC Channel1 使用 DMA2_Channel3。
-     * 注意：
-     * 如果这里误用 DMA1_Channel3，PA4 很可能只输出固定电压，
-     * 不会有连续正弦波。
      */
     DMA_DeInit(DMA2_Channel3);
     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&DAC->DHR12R1;
@@ -319,7 +342,26 @@ uint32_t DACWave_GetFreq(void)
 
 void DACWave_SetAmplitudeScale(float scale)
 {
-    DACWave_AmpScale = DACWave_LimitFloat(scale, AMP_SCALE_MIN, AMP_SCALE_MAX);
+    float new_scale;
+    float diff;
+
+    new_scale = DACWave_LimitFloat(scale, AMP_SCALE_MIN, AMP_SCALE_MAX);
+
+    diff = new_scale - DACWave_AmpScale;
+    if (diff < 0.0f)
+    {
+        diff = -diff;
+    }
+
+    /*
+     * 幅度变化太小时不更新波表，避免自动调幅稳定后仍反复刷新。
+     */
+    if (diff < 0.001f)
+    {
+        return;
+    }
+
+    DACWave_AmpScale = new_scale;
     DACWave_UpdateTable();
 }
 
@@ -335,7 +377,13 @@ void DACWave_SetWaveform(Waveform_t waveform)
         waveform = WAVEFORM_SINE;
     }
 
+    if (DACWave_Waveform == waveform)
+    {
+        return;
+    }
+
     DACWave_Waveform = waveform;
+    DACWave_UpdateNormTable();
     DACWave_UpdateTable();
 }
 
