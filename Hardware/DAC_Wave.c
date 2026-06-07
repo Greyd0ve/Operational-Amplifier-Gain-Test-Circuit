@@ -7,6 +7,24 @@
 #define DAC_SQRT2               1.414213562f
 #define DAC_NORM_MAX            32767
 
+/*
+ * 幅值校准系数：
+ *
+ * 当前实测：
+ *   正弦波：77.6mVrms
+ *   三角波：62.8mVrms
+ *
+ * 目标：
+ *   正弦波：100mVrms
+ *   三角波：100mVrms
+ *
+ * 所以：
+ *   正弦校准系数 = 100 / 77.6 ≈ 1.289
+ *   三角校准系数 = 100 / 62.8 ≈ 1.592
+ */
+#define DAC_SINE_CAL_SCALE      1.279f
+#define DAC_TRI_CAL_SCALE       1.602f
+
 static uint16_t DACWave_Table[WAVE_TABLE_SIZE];
 static int16_t DACWave_NormTable[WAVE_TABLE_SIZE];
 
@@ -187,9 +205,9 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
 
 /**
  * @brief  根据当前幅度系数重新生成 DAC 输出表
- * @note   这个函数不再关闭 TIM6。
- *         这样自动调幅时不会出现明显直线段。
- *         代价是表更新瞬间可能有极轻微幅值过渡，但通常比暂停波形更好。
+ * @note   amp_scale = 1.0 时：
+ *         正弦波经校准后目标约 100mVrms
+ *         三角波经校准后目标约 100mVrms
  */
 void DACWave_UpdateTable(void)
 {
@@ -200,16 +218,23 @@ void DACWave_UpdateTable(void)
     int32_t code;
 
     /*
-     * 100mVrms 正弦波：
+     * 基础幅度：
+     * 正弦波 100mVrms 时：
      * Vp = 0.1 * sqrt(2) = 0.141V
      * amp_code = Vp / 3.3 * 4095 ≈ 175
      *
-     * PA4 原始 DAC 输出应为：
-     * 1.65V ± 0.141V
-     * Vpp ≈ 282mV
+     * 之后再乘以校准系数，补偿实际硬件衰减。
      */
     base_amp_code_f = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
-    amp_code_f = base_amp_code_f * DACWave_AmpScale;
+
+    if (DACWave_Waveform == WAVEFORM_TRIANGLE)
+    {
+        amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_TRI_CAL_SCALE;
+    }
+    else
+    {
+        amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_SINE_CAL_SCALE;
+    }
 
     if (amp_code_f > (float)(DAC_MID_CODE - 1))
     {
