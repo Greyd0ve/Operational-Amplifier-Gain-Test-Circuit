@@ -9,12 +9,16 @@
 #define FREQ_MAX_HZ             2000
 #define FREQ_STEP_HZ            50
 
-#define WAVE_TABLE_SIZE         128
+/* 36 points lets 72MHz TIM6 keep all 50Hz steps within 0.5 per-mille. */
+#define WAVE_TABLE_SIZE         36
 
 #define DAC_BITS                12
 #define DAC_MAX_CODE            4095
 #define DAC_MID_CODE            2048
 #define DAC_VREF                3.3f
+
+#define DAC_SINE_CAL_SCALE      1.289f
+#define DAC_TRI_CAL_SCALE       1.592f
 
 #define ADC_REF_VOLT            3.3f
 #define ADC_MAX_CODE_F          4095.0f

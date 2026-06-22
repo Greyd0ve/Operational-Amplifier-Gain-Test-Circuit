@@ -5,6 +5,7 @@
 
 #define DAC_TWO_PI              6.283185307f
 #define DAC_SQRT2               1.414213562f
+#define DAC_SQRT3               1.732050808f
 #define DAC_NORM_MAX            32767
 
 /*
@@ -22,9 +23,6 @@
  *   正弦校准系数 = 100 / 77.6 ≈ 1.289
  *   三角校准系数 = 100 / 62.8 ≈ 1.592
  */
-#define DAC_SINE_CAL_SCALE      1.279f
-#define DAC_TRI_CAL_SCALE       1.602f
-
 static uint16_t DACWave_Table[WAVE_TABLE_SIZE];
 static int16_t DACWave_NormTable[WAVE_TABLE_SIZE];
 
@@ -144,7 +142,7 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
      *
      * DAC 更新频率 = 输出频率 * 波表点数
      */
-    arr_reload = SYSCLK_HZ / dac_update_rate;
+    arr_reload = (SYSCLK_HZ + (dac_update_rate / 2)) / dac_update_rate;
 
     if (arr_reload < 2)
     {
@@ -167,7 +165,8 @@ static void DACWave_ConfigTIM6(uint32_t freq_hz)
             prescaler_div = 65536UL;
         }
 
-        arr_reload = SYSCLK_HZ / (dac_update_rate * prescaler_div);
+        arr_reload = (SYSCLK_HZ + ((dac_update_rate * prescaler_div) / 2)) /
+                     (dac_update_rate * prescaler_div);
 
         if (arr_reload < 2)
         {
@@ -218,21 +217,19 @@ void DACWave_UpdateTable(void)
     int32_t code;
 
     /*
-     * 基础幅度：
-     * 正弦波 100mVrms 时：
-     * Vp = 0.1 * sqrt(2) = 0.141V
-     * amp_code = Vp / 3.3 * 4095 ≈ 175
-     *
-     * 之后再乘以校准系数，补偿实际硬件衰减。
+     * Base peak amplitude:
+     *   sine     Vrms = Vp / sqrt(2)
+     *   triangle Vrms = Vp / sqrt(3)
+     * Calibration scales compensate real board attenuation.
      */
-    base_amp_code_f = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
-
     if (DACWave_Waveform == WAVEFORM_TRIANGLE)
     {
+        base_amp_code_f = US_INIT_RMS * DAC_SQRT3 / DAC_VREF * (float)DAC_MAX_CODE;
         amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_TRI_CAL_SCALE;
     }
     else
     {
+        base_amp_code_f = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
         amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_SINE_CAL_SCALE;
     }
 

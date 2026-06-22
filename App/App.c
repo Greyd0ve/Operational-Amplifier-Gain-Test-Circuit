@@ -172,9 +172,11 @@ static void App_DisplayDebug(void)
 
     OLED_ShowString(2, 1, "UiD:");
     OLED_ShowFixed(2, 5, App_Result.ui_dc, 1, 3);
+    OLED_ShowString(2, 10, "V");
 
     OLED_ShowString(3, 1, "UoD:");
     OLED_ShowFixed(3, 5, App_Result.uo_dc, 1, 3);
+    OLED_ShowString(3, 10, "V");
 
     OLED_ShowString(4, 1, "Clip:");
     OLED_ShowNum(4, 6, App_Result.clip, 1);

@@ -6,6 +6,7 @@
 
 static uint16_t AD_RawBuf[AD_DMA_BUF_LEN];
 static volatile uint8_t AD_FrameReady = 0;
+static volatile uint8_t AD_Running = 0;
 
 static void AD_ConfigRegularChannels(void)
 {
@@ -13,10 +14,39 @@ static void AD_ConfigRegularChannels(void)
     ADC_RegularChannelConfig(ADC1, UO_ADC_CHANNEL, 2, ADC_SampleTime_55Cycles5);
 }
 
+static void AD_ConfigADCScanDMA(void)
+{
+    ADC_InitTypeDef ADC_InitStructure;
+
+    ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;
+    ADC_InitStructure.ADC_ScanConvMode = ENABLE;
+    ADC_InitStructure.ADC_ContinuousConvMode = ENABLE;
+    ADC_InitStructure.ADC_ExternalTrigConv = ADC_ExternalTrigConv_None;
+    ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
+    ADC_InitStructure.ADC_NbrOfChannel = 2;
+    ADC_Init(ADC1, &ADC_InitStructure);
+
+    AD_ConfigRegularChannels();
+}
+
+static void AD_ConfigADCSingle(uint8_t ADC_Channel)
+{
+    ADC_InitTypeDef ADC_InitStructure;
+
+    ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;
+    ADC_InitStructure.ADC_ScanConvMode = DISABLE;
+    ADC_InitStructure.ADC_ContinuousConvMode = DISABLE;
+    ADC_InitStructure.ADC_ExternalTrigConv = ADC_ExternalTrigConv_None;
+    ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
+    ADC_InitStructure.ADC_NbrOfChannel = 1;
+    ADC_Init(ADC1, &ADC_InitStructure);
+
+    ADC_RegularChannelConfig(ADC1, ADC_Channel, 1, ADC_SampleTime_55Cycles5);
+}
+
 void AD_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
-    ADC_InitTypeDef ADC_InitStructure;
     DMA_InitTypeDef DMA_InitStructure;
     NVIC_InitTypeDef NVIC_InitStructure;
 
@@ -50,14 +80,7 @@ void AD_Init(void)
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_Init(&NVIC_InitStructure);
 
-    ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;
-    ADC_InitStructure.ADC_ScanConvMode = ENABLE;
-    ADC_InitStructure.ADC_ContinuousConvMode = ENABLE;
-    ADC_InitStructure.ADC_ExternalTrigConv = ADC_ExternalTrigConv_None;
-    ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
-    ADC_InitStructure.ADC_NbrOfChannel = 2;
-    ADC_Init(ADC1, &ADC_InitStructure);
-    AD_ConfigRegularChannels();
+    AD_ConfigADCScanDMA();
 
     ADC_DMACmd(ADC1, ENABLE);
     ADC_Cmd(ADC1, ENABLE);
@@ -68,20 +91,29 @@ void AD_Init(void)
     while (ADC_GetCalibrationStatus(ADC1) == SET);
 
     ADC_Cmd(ADC1, DISABLE);
+    ADC_DMACmd(ADC1, DISABLE);
+    AD_FrameReady = 0;
+    AD_Running = 0;
 }
 
 void AD_Start(void)
 {
+    ADC_SoftwareStartConvCmd(ADC1, DISABLE);
+    ADC_DMACmd(ADC1, DISABLE);
+    ADC_Cmd(ADC1, DISABLE);
+
     DMA_Cmd(DMA1_Channel1, DISABLE);
     DMA_SetCurrDataCounter(DMA1_Channel1, AD_DMA_BUF_LEN);
     DMA_ClearFlag(DMA1_FLAG_GL1 | DMA1_FLAG_TC1 | DMA1_FLAG_HT1 | DMA1_FLAG_TE1);
     AD_FrameReady = 0;
 
-    AD_ConfigRegularChannels();
+    AD_ConfigADCScanDMA();
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
     ADC_DMACmd(ADC1, ENABLE);
-    ADC_Cmd(ADC1, ENABLE);
     DMA_Cmd(DMA1_Channel1, ENABLE);
+    ADC_Cmd(ADC1, ENABLE);
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+    AD_Running = 1;
 }
 
 uint8_t AD_IsFrameReady(void)
@@ -124,9 +156,22 @@ void AD_GetFrame(float *ui_buf, float *uo_buf, uint16_t len)
 uint16_t AD_GetValue(uint8_t ADC_Channel)
 {
     uint32_t timeout;
+    uint16_t value;
+    uint8_t was_running;
 
+    value = 0;
+    was_running = AD_Running;
+
+    ADC_SoftwareStartConvCmd(ADC1, DISABLE);
+    ADC_DMACmd(ADC1, DISABLE);
+    ADC_Cmd(ADC1, DISABLE);
+    DMA_Cmd(DMA1_Channel1, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_GL1 | DMA1_FLAG_TC1 | DMA1_FLAG_HT1 | DMA1_FLAG_TE1);
+    AD_Running = 0;
+
+    AD_ConfigADCSingle(ADC_Channel);
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
     ADC_Cmd(ADC1, ENABLE);
-    ADC_RegularChannelConfig(ADC1, ADC_Channel, 1, ADC_SampleTime_55Cycles5);
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
 
     timeout = 100000;
@@ -135,12 +180,21 @@ uint16_t AD_GetValue(uint8_t ADC_Channel)
         timeout--;
     }
 
-    if (timeout == 0)
+    if (timeout != 0)
     {
-        return 0;
+        value = ADC_GetConversionValue(ADC1);
     }
 
-    return ADC_GetConversionValue(ADC1);
+    ADC_SoftwareStartConvCmd(ADC1, DISABLE);
+    ADC_Cmd(ADC1, DISABLE);
+    AD_ConfigADCScanDMA();
+
+    if (was_running)
+    {
+        AD_Start();
+    }
+
+    return value;
 }
 
 void AD_DMA1_Channel1_IRQHandler(void)
@@ -149,8 +203,10 @@ void AD_DMA1_Channel1_IRQHandler(void)
     {
         DMA_ClearITPendingBit(DMA1_IT_GL1);
         ADC_SoftwareStartConvCmd(ADC1, DISABLE);
+        ADC_DMACmd(ADC1, DISABLE);
         ADC_Cmd(ADC1, DISABLE);
         DMA_Cmd(DMA1_Channel1, DISABLE);
+        AD_Running = 0;
         AD_FrameReady = 1;
     }
 }
