@@ -64,6 +64,21 @@ static void OLED_ShowFixed(uint8_t Line, uint8_t Column, float num, uint8_t int_
     OLED_ShowNum(Line, Column + int_len + 1, frac_part, frac_len);
 }
 
+static void OLED_ShowSignedFixed(uint8_t Line, uint8_t Column, float num, uint8_t int_len, uint8_t frac_len)
+{
+    if (num < 0.0f)
+    {
+        OLED_ShowChar(Line, Column, '-');
+        num = -num;
+    }
+    else
+    {
+        OLED_ShowChar(Line, Column, '+');
+    }
+
+    OLED_ShowFixed(Line, Column + 1, num, int_len, frac_len);
+}
+
 static void App_HandleKey(KeyEvent_t event)
 {
     uint32_t freq;
@@ -75,6 +90,8 @@ static void App_HandleKey(KeyEvent_t event)
         case KEY1_SHORT:
             freq = App_LimitFreq(freq + FREQ_STEP_HZ);
             DACWave_SetFreq(freq);
+            AutoGain_ResetTracking();
+            Measure_ResetPhaseTracking();
             break;
 
         case KEY1_LONG:
@@ -87,10 +104,20 @@ static void App_HandleKey(KeyEvent_t event)
                 freq = FREQ_MIN_HZ;
             }
             DACWave_SetFreq(freq);
+            AutoGain_ResetTracking();
+            Measure_ResetPhaseTracking();
             break;
 
         case KEY2_SHORT:
-            AutoGain_Enable(!AutoGain_IsEnabled());
+            if (AutoGain_IsEnabled())
+            {
+                AutoGain_Enable(0);
+                DACWave_SetAmplitudeScale(AMP_SCALE_INIT);
+            }
+            else
+            {
+                AutoGain_Enable(1);
+            }
             break;
 
         case KEY2_LONG:
@@ -107,6 +134,8 @@ static void App_HandleKey(KeyEvent_t event)
             {
                 DACWave_SetWaveform(WAVEFORM_SINE);
             }
+            AutoGain_ResetTracking();
+            Measure_ResetPhaseTracking();
             break;
 
         case KEY3_LONG:
@@ -152,14 +181,15 @@ static void App_DisplayMain(void)
     OLED_ShowFixed(3, 4, App_Result.uo_rms, 1, 3);
     OLED_ShowString(3, 9, "V");
 
-    OLED_ShowString(4, 1, "G:");
-    if (App_Result.gain_valid)
+    OLED_ShowString(4, 1, "Ph:");
+    if (App_Result.phase_valid)
     {
-        OLED_ShowFixed(4, 3, App_Result.gain, 2, 2);
+        OLED_ShowSignedFixed(4, 4, App_Result.phase_diff, 3, 1);
+        OLED_ShowString(4, 10, "deg");
     }
     else
     {
-        OLED_ShowString(4, 3, "--.--");
+        OLED_ShowString(4, 4, "---.-deg");
     }
 }
 
@@ -219,9 +249,11 @@ void App_Init(void)
     App_Result.ui_rms = 0.0f;
     App_Result.uo_rms = 0.0f;
     App_Result.gain = 0.0f;
+    App_Result.phase_diff = 0.0f;
     App_Result.set_freq = (float)FREQ_MIN_HZ;
     App_Result.meas_freq = (float)FREQ_MIN_HZ;
     App_Result.gain_valid = 0;
+    App_Result.phase_valid = 0;
     App_Result.clip = 0;
 
     Delay_ms(300);

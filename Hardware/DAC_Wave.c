@@ -3,33 +3,23 @@
 #include "AppConfig.h"
 #include <math.h>
 
-#define DAC_TWO_PI              6.283185307f
-#define DAC_SQRT2               1.414213562f
-#define DAC_SQRT3               1.732050808f
-#define DAC_NORM_MAX            32767
+#define DACWAVE_SAMPLE_COUNT_MIN        ((uint16_t)WAVE_TABLE_SIZE_MIN)
+#define DACWAVE_SAMPLE_COUNT_MAX        ((uint16_t)WAVE_TABLE_SIZE_MAX)
+#define DACWAVE_SHAPE_SCALE             32767.0
+#define DACWAVE_PI                      3.14159265358979323846
+#define DACWAVE_SCALE_SEARCH_ITERS      ((uint8_t)24u)
+#define DACWAVE_FREQUENCY_MAX_ERROR     0.0005
 
-/*
- * 幅值校准系数：
- *
- * 当前实测：
- *   正弦波：77.6mVrms
- *   三角波：62.8mVrms
- *
- * 目标：
- *   正弦波：100mVrms
- *   三角波：100mVrms
- *
- * 所以：
- *   正弦校准系数 = 100 / 77.6 ≈ 1.289
- *   三角校准系数 = 100 / 62.8 ≈ 1.592
- */
-static uint16_t DACWave_Table[WAVE_TABLE_SIZE];
-static int16_t DACWave_NormTable[WAVE_TABLE_SIZE];
+static uint16_t DACWave_Table[DACWAVE_SAMPLE_COUNT_MAX];
+static int16_t DACWave_ShapeTable[DACWAVE_SAMPLE_COUNT_MAX];
 
 static uint32_t DACWave_FreqHz = FREQ_MIN_HZ;
 static float DACWave_AmpScale = AMP_SCALE_INIT;
 static Waveform_t DACWave_Waveform = WAVEFORM_SINE;
 static uint8_t DACWave_Running = 0;
+static uint16_t DACWave_SampleCount = 0;
+static uint16_t DACWave_TimerPeriod = 0;
+static uint32_t DACWave_TimerClockHz = SYSCLK_HZ;
 
 static float DACWave_LimitFloat(float value, float min, float max)
 {
@@ -61,246 +51,333 @@ static uint32_t DACWave_LimitFreq(uint32_t freq_hz)
     return freq_hz;
 }
 
-static float DACWave_GetTriangleSample(uint16_t index)
+static double DACWave_AbsDouble(double value)
 {
-    float pos;
-
-    pos = (float)index / (float)WAVE_TABLE_SIZE;
-
-    if (pos < 0.25f)
-    {
-        return pos * 4.0f;
-    }
-    else if (pos < 0.75f)
-    {
-        return 2.0f - pos * 4.0f;
-    }
-    else
-    {
-        return pos * 4.0f - 4.0f;
-    }
+    return (value < 0.0) ? -value : value;
 }
 
-/**
- * @brief  生成归一化波形表
- * @note   范围约为 -32767 ~ +32767
- *         只在初始化或切换波形时调用，不在自动调幅时反复调用 sinf
- */
-static void DACWave_UpdateNormTable(void)
+static uint16_t DACWave_ToDacCode(double value)
+{
+    if (value <= 0.0)
+    {
+        return 0u;
+    }
+
+    if (value >= (double)DAC_MAX_CODE)
+    {
+        return (uint16_t)DAC_MAX_CODE;
+    }
+
+    return (uint16_t)(value + 0.5);
+}
+
+static uint16_t DACWave_GetMidCode(void)
+{
+    return DACWave_ToDacCode((double)DAC_MID_CODE);
+}
+
+static uint32_t DACWave_GetTIM6ClockHz(void)
+{
+    RCC_ClocksTypeDef clocks;
+
+    RCC_GetClocksFreq(&clocks);
+
+    if (clocks.PCLK1_Frequency == 0u)
+    {
+        return SYSCLK_HZ;
+    }
+
+    if (clocks.PCLK1_Frequency == clocks.HCLK_Frequency)
+    {
+        return clocks.PCLK1_Frequency;
+    }
+
+    return clocks.PCLK1_Frequency * 2u;
+}
+
+static double DACWave_RawSample(Waveform_t waveform, uint16_t index, uint16_t sample_count)
+{
+    double phase;
+
+    phase = (double)index / (double)sample_count;
+
+    if (waveform == WAVEFORM_SINE)
+    {
+        return sin(2.0 * DACWAVE_PI * phase);
+    }
+
+    if (phase < 0.25)
+    {
+        return 4.0 * phase;
+    }
+
+    if (phase < 0.75)
+    {
+        return 2.0 - 4.0 * phase;
+    }
+
+    return -4.0 + 4.0 * phase;
+}
+
+static double DACWave_ShapeSample(uint16_t index)
+{
+    return (double)DACWave_ShapeTable[index] / DACWAVE_SHAPE_SCALE;
+}
+
+static void DACWave_BuildShapeTable(void)
 {
     uint16_t i;
-    float sample;
-    int32_t value;
+    double raw;
+    double shape;
 
-    for (i = 0; i < WAVE_TABLE_SIZE; i++)
+    for (i = 0; i < DACWave_SampleCount; i++)
     {
-        if (DACWave_Waveform == WAVEFORM_TRIANGLE)
+        raw = DACWave_RawSample(DACWave_Waveform, i, DACWave_SampleCount);
+        shape = raw * DACWAVE_SHAPE_SCALE;
+
+        if (shape >= DACWAVE_SHAPE_SCALE)
         {
-            sample = DACWave_GetTriangleSample(i);
+            DACWave_ShapeTable[i] = (int16_t)DACWAVE_SHAPE_SCALE;
+        }
+        else if (shape <= -DACWAVE_SHAPE_SCALE)
+        {
+            DACWave_ShapeTable[i] = (int16_t)(-DACWAVE_SHAPE_SCALE);
+        }
+        else if (shape >= 0.0)
+        {
+            DACWave_ShapeTable[i] = (int16_t)(shape + 0.5);
         }
         else
         {
-            sample = sinf(DAC_TWO_PI * (float)i / (float)WAVE_TABLE_SIZE);
+            DACWave_ShapeTable[i] = (int16_t)(shape - 0.5);
         }
-
-        value = (int32_t)(sample * (float)DAC_NORM_MAX);
-
-        if (value > DAC_NORM_MAX)
-        {
-            value = DAC_NORM_MAX;
-        }
-
-        if (value < -DAC_NORM_MAX)
-        {
-            value = -DAC_NORM_MAX;
-        }
-
-        DACWave_NormTable[i] = (int16_t)value;
     }
 }
 
-static void DACWave_ConfigTIM6(uint32_t freq_hz)
+static double DACWave_CalcShapeRms(void)
+{
+    uint16_t i;
+    double sample;
+    double sum;
+
+    sum = 0.0;
+
+    for (i = 0; i < DACWave_SampleCount; i++)
+    {
+        sample = DACWave_ShapeSample(i);
+        sum += sample * sample;
+    }
+
+    return sqrt(sum / (double)DACWave_SampleCount);
+}
+
+static double DACWave_CalcRoundedRms(double scale)
+{
+    uint16_t i;
+    uint16_t code;
+    double sample;
+    double ac_code;
+    double sum;
+
+    sum = 0.0;
+
+    for (i = 0; i < DACWave_SampleCount; i++)
+    {
+        sample = DACWave_ShapeSample(i);
+        code = DACWave_ToDacCode((double)DAC_MID_CODE + scale * sample);
+        ac_code = (double)code - (double)DAC_MID_CODE;
+        sum += ac_code * ac_code;
+    }
+
+    return sqrt(sum / (double)DACWave_SampleCount);
+}
+
+static double DACWave_GetTargetRmsCode(void)
+{
+    double target_rms_code;
+
+    target_rms_code = ((double)US_INIT_RMS * (double)DACWave_AmpScale *
+                       (double)DAC_MAX_CODE) / (double)DAC_VREF;
+
+    if (DACWave_Waveform == WAVEFORM_TRIANGLE)
+    {
+        target_rms_code *= (double)DAC_TRI_CAL_SCALE;
+    }
+    else
+    {
+        target_rms_code *= (double)DAC_SINE_CAL_SCALE;
+    }
+
+    return target_rms_code;
+}
+
+static double DACWave_SelectScale(double nominal_scale, double target_rms_code)
+{
+    uint8_t i;
+    double low;
+    double high;
+    double mid;
+    double low_error;
+    double high_error;
+    double nominal_error;
+
+    low = nominal_scale * 0.96;
+    high = nominal_scale * 1.04;
+
+    for (i = 0; i < DACWAVE_SCALE_SEARCH_ITERS; i++)
+    {
+        mid = (low + high) * 0.5;
+
+        if (DACWave_CalcRoundedRms(mid) < target_rms_code)
+        {
+            low = mid;
+        }
+        else
+        {
+            high = mid;
+        }
+    }
+
+    low_error = DACWave_AbsDouble(DACWave_CalcRoundedRms(low) - target_rms_code);
+    high_error = DACWave_AbsDouble(DACWave_CalcRoundedRms(high) - target_rms_code);
+    nominal_error = DACWave_AbsDouble(DACWave_CalcRoundedRms(nominal_scale) - target_rms_code);
+
+    if ((nominal_error <= low_error) && (nominal_error <= high_error))
+    {
+        return nominal_scale;
+    }
+
+    return (low_error <= high_error) ? low : high;
+}
+
+void DACWave_UpdateTable(void)
+{
+    uint16_t i;
+    double shape_rms;
+    double target_rms_code;
+    double nominal_scale;
+    double scale;
+    double sample;
+
+    if (DACWave_SampleCount == 0u)
+    {
+        return;
+    }
+
+    target_rms_code = DACWave_GetTargetRmsCode();
+    shape_rms = DACWave_CalcShapeRms();
+
+    if (shape_rms <= 0.0)
+    {
+        scale = 0.0;
+    }
+    else
+    {
+        nominal_scale = target_rms_code / shape_rms;
+        scale = DACWave_SelectScale(nominal_scale, target_rms_code);
+    }
+
+    for (i = 0; i < DACWave_SampleCount; i++)
+    {
+        sample = DACWave_ShapeSample(i);
+        DACWave_Table[i] = DACWave_ToDacCode((double)DAC_MID_CODE + scale * sample);
+    }
+}
+
+static void DACWave_SelectTiming(uint32_t freq_hz, uint16_t *sample_count, uint16_t *timer_period)
+{
+    uint16_t count;
+    uint32_t period;
+    uint16_t best_count;
+    uint16_t best_period;
+    uint16_t fallback_count;
+    uint16_t fallback_period;
+    double target_total_ticks;
+    double actual_frequency;
+    double error;
+    double best_error;
+    double fallback_error;
+
+    target_total_ticks = (double)DACWave_TimerClockHz / (double)freq_hz;
+    best_count = 0u;
+    best_period = 0u;
+    best_error = 1.0;
+    fallback_count = DACWAVE_SAMPLE_COUNT_MIN;
+    fallback_period = (uint16_t)(target_total_ticks / (double)DACWAVE_SAMPLE_COUNT_MIN + 0.5);
+    fallback_error = 1.0;
+
+    for (count = DACWAVE_SAMPLE_COUNT_MIN; count <= DACWAVE_SAMPLE_COUNT_MAX; count++)
+    {
+        period = (uint32_t)(target_total_ticks / (double)count + 0.5);
+
+        if ((period == 0u) || (period > 0xFFFFu))
+        {
+            continue;
+        }
+
+        actual_frequency = (double)DACWave_TimerClockHz / ((double)period * (double)count);
+        error = DACWave_AbsDouble(actual_frequency - (double)freq_hz) / (double)freq_hz;
+
+        if ((error < fallback_error) ||
+            ((DACWave_AbsDouble(error - fallback_error) < 0.000000001) &&
+             (count > fallback_count)))
+        {
+            fallback_error = error;
+            fallback_count = count;
+            fallback_period = (uint16_t)period;
+        }
+
+        if (error > DACWAVE_FREQUENCY_MAX_ERROR)
+        {
+            continue;
+        }
+
+        if ((best_count == 0u) ||
+            (count > best_count) ||
+            ((count == best_count) && (error < best_error)))
+        {
+            best_error = error;
+            best_count = count;
+            best_period = (uint16_t)period;
+        }
+    }
+
+    if (best_count == 0u)
+    {
+        best_count = fallback_count;
+        best_period = fallback_period;
+    }
+
+    *sample_count = best_count;
+    *timer_period = best_period;
+}
+
+static void DACWave_ConfigTIM6(void)
 {
     TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
-    uint32_t dac_update_rate;
-    uint32_t arr_reload;
-    uint32_t prescaler_div;
-    uint8_t was_running;
 
-    dac_update_rate = freq_hz * WAVE_TABLE_SIZE;
-
-    if (dac_update_rate == 0)
-    {
-        dac_update_rate = 1;
-    }
-
-    /*
-     * STM32F103RCT6 常见配置：
-     * SYSCLK = 72MHz
-     * APB1 = 36MHz
-     * TIM6 时钟 = 72MHz
-     *
-     * DAC 更新频率 = 输出频率 * 波表点数
-     */
-    arr_reload = (SYSCLK_HZ + (dac_update_rate / 2)) / dac_update_rate;
-
-    if (arr_reload < 2)
-    {
-        arr_reload = 2;
-    }
-
-    prescaler_div = 1;
-
-    if (arr_reload > 65536UL)
-    {
-        prescaler_div = (arr_reload + 65535UL) / 65536UL;
-
-        if (prescaler_div < 1)
-        {
-            prescaler_div = 1;
-        }
-
-        if (prescaler_div > 65536UL)
-        {
-            prescaler_div = 65536UL;
-        }
-
-        arr_reload = (SYSCLK_HZ + ((dac_update_rate * prescaler_div) / 2)) /
-                     (dac_update_rate * prescaler_div);
-
-        if (arr_reload < 2)
-        {
-            arr_reload = 2;
-        }
-
-        if (arr_reload > 65536UL)
-        {
-            arr_reload = 65536UL;
-        }
-    }
-
-    was_running = DACWave_Running;
-
-    if (was_running)
-    {
-        TIM_Cmd(TIM6, DISABLE);
-    }
-
-    TIM_TimeBaseStructure.TIM_Period = (uint16_t)(arr_reload - 1);
-    TIM_TimeBaseStructure.TIM_Prescaler = (uint16_t)(prescaler_div - 1);
+    TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+    TIM_TimeBaseStructure.TIM_Period = (uint16_t)(DACWave_TimerPeriod - 1u);
+    TIM_TimeBaseStructure.TIM_Prescaler = 0u;
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
     TIM_TimeBaseInit(TIM6, &TIM_TimeBaseStructure);
 
     TIM_SelectOutputTrigger(TIM6, TIM_TRGOSource_Update);
-    TIM_SetCounter(TIM6, 0);
+    TIM_SetCounter(TIM6, 0u);
     TIM_ClearFlag(TIM6, TIM_FLAG_Update);
-
-    if (was_running)
-    {
-        TIM_Cmd(TIM6, ENABLE);
-    }
 }
 
-/**
- * @brief  根据当前幅度系数重新生成 DAC 输出表
- * @note   amp_scale = 1.0 时：
- *         正弦波经校准后目标约 100mVrms
- *         三角波经校准后目标约 100mVrms
- */
-void DACWave_UpdateTable(void)
+static void DACWave_ConfigDMA(void)
 {
-    uint16_t i;
-    float base_amp_code_f;
-    float amp_code_f;
-    int32_t amp_code;
-    int32_t code;
-
-    /*
-     * Base peak amplitude:
-     *   sine     Vrms = Vp / sqrt(2)
-     *   triangle Vrms = Vp / sqrt(3)
-     * Calibration scales compensate real board attenuation.
-     */
-    if (DACWave_Waveform == WAVEFORM_TRIANGLE)
-    {
-        base_amp_code_f = US_INIT_RMS * DAC_SQRT3 / DAC_VREF * (float)DAC_MAX_CODE;
-        amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_TRI_CAL_SCALE;
-    }
-    else
-    {
-        base_amp_code_f = US_INIT_RMS * DAC_SQRT2 / DAC_VREF * (float)DAC_MAX_CODE;
-        amp_code_f = base_amp_code_f * DACWave_AmpScale * DAC_SINE_CAL_SCALE;
-    }
-
-    if (amp_code_f > (float)(DAC_MID_CODE - 1))
-    {
-        amp_code_f = (float)(DAC_MID_CODE - 1);
-    }
-
-    if (amp_code_f < 0.0f)
-    {
-        amp_code_f = 0.0f;
-    }
-
-    amp_code = (int32_t)(amp_code_f + 0.5f);
-
-    for (i = 0; i < WAVE_TABLE_SIZE; i++)
-    {
-        code = (int32_t)DAC_MID_CODE;
-        code += (amp_code * (int32_t)DACWave_NormTable[i]) / DAC_NORM_MAX;
-
-        if (code < 0)
-        {
-            code = 0;
-        }
-
-        if (code > DAC_MAX_CODE)
-        {
-            code = DAC_MAX_CODE;
-        }
-
-        DACWave_Table[i] = (uint16_t)code;
-    }
-}
-
-void DACWave_Init(void)
-{
-    GPIO_InitTypeDef GPIO_InitStructure;
-    DAC_InitTypeDef DAC_InitStructure;
     DMA_InitTypeDef DMA_InitStructure;
 
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_DAC | RCC_APB1Periph_TIM6, ENABLE);
-
-    /*
-     * STM32F103RCT6 / 高密度 F103：
-     * DAC Channel1 对应 DMA2_Channel3
-     */
-    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
-
-    /* PA4 -> DAC_OUT1，配置为模拟模式 */
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
-    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOA, &GPIO_InitStructure);
-
-    DACWave_FreqHz = FREQ_MIN_HZ;
-    DACWave_AmpScale = AMP_SCALE_INIT;
-    DACWave_Waveform = WAVEFORM_SINE;
-    DACWave_Running = 0;
-
-    DACWave_UpdateNormTable();
-    DACWave_UpdateTable();
-
-    /*
-     * DAC Channel1 使用 DMA2_Channel3。
-     */
     DMA_DeInit(DMA2_Channel3);
+    DMA_StructInit(&DMA_InitStructure);
     DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&DAC->DHR12R1;
     DMA_InitStructure.DMA_MemoryBaseAddr = (uint32_t)DACWave_Table;
     DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralDST;
-    DMA_InitStructure.DMA_BufferSize = WAVE_TABLE_SIZE;
+    DMA_InitStructure.DMA_BufferSize = DACWave_SampleCount;
     DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
     DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
     DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
@@ -309,52 +386,113 @@ void DACWave_Init(void)
     DMA_InitStructure.DMA_Priority = DMA_Priority_High;
     DMA_InitStructure.DMA_M2M = DMA_M2M_Disable;
     DMA_Init(DMA2_Channel3, &DMA_InitStructure);
-
-    DAC_InitStructure.DAC_Trigger = DAC_Trigger_T6_TRGO;
-    DAC_InitStructure.DAC_WaveGeneration = DAC_WaveGeneration_None;
-    DAC_InitStructure.DAC_LFSRUnmask_TriangleAmplitude = DAC_LFSRUnmask_Bit0;
-    DAC_InitStructure.DAC_OutputBuffer = DAC_OutputBuffer_Enable;
-    DAC_Init(DAC_Channel_1, &DAC_InitStructure);
-
-    DAC_Cmd(DAC_Channel_1, ENABLE);
-    DAC_SetChannel1Data(DAC_Align_12b_R, DAC_MID_CODE);
-
-    DACWave_ConfigTIM6(DACWave_FreqHz);
 }
 
-void DACWave_Start(void)
+static void DACWave_StopTransfer(void)
+{
+    TIM_Cmd(TIM6, DISABLE);
+    DAC_DMACmd(DAC_Channel_1, DISABLE);
+    DMA_Cmd(DMA2_Channel3, DISABLE);
+    DMA_ClearFlag(DMA2_FLAG_GL3 | DMA2_FLAG_TC3 | DMA2_FLAG_HT3 | DMA2_FLAG_TE3);
+}
+
+static void DACWave_StartTransfer(void)
 {
     TIM_Cmd(TIM6, DISABLE);
 
     DMA_Cmd(DMA2_Channel3, DISABLE);
-    DMA_SetCurrDataCounter(DMA2_Channel3, WAVE_TABLE_SIZE);
+    DMA_SetCurrDataCounter(DMA2_Channel3, DACWave_SampleCount);
     DMA_ClearFlag(DMA2_FLAG_GL3 | DMA2_FLAG_TC3 | DMA2_FLAG_HT3 | DMA2_FLAG_TE3);
     DMA_Cmd(DMA2_Channel3, ENABLE);
 
+    DAC_SetChannel1Data(DAC_Align_12b_R, DACWave_Table[0]);
     DAC_DMACmd(DAC_Channel_1, ENABLE);
 
-    TIM_SetCounter(TIM6, 0);
+    TIM_SetCounter(TIM6, 0u);
     TIM_ClearFlag(TIM6, TIM_FLAG_Update);
     TIM_Cmd(TIM6, ENABLE);
+}
 
+static void DACWave_ApplyTiming(void)
+{
+    uint8_t was_running;
+
+    was_running = DACWave_Running;
+    if (was_running)
+    {
+        DACWave_StopTransfer();
+        DACWave_Running = 0;
+    }
+
+    DACWave_SelectTiming(DACWave_FreqHz, &DACWave_SampleCount, &DACWave_TimerPeriod);
+    DACWave_BuildShapeTable();
+    DACWave_UpdateTable();
+    DACWave_ConfigTIM6();
+    DACWave_ConfigDMA();
+
+    if (was_running)
+    {
+        DACWave_StartTransfer();
+        DACWave_Running = 1;
+    }
+}
+
+void DACWave_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    DAC_InitTypeDef DAC_InitStructure;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_DAC | RCC_APB1Periph_TIM6, ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
+
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    DACWave_TimerClockHz = DACWave_GetTIM6ClockHz();
+    DACWave_FreqHz = FREQ_MIN_HZ;
+    DACWave_AmpScale = AMP_SCALE_INIT;
+    DACWave_Waveform = WAVEFORM_SINE;
+    DACWave_Running = 0;
+
+    DAC_StructInit(&DAC_InitStructure);
+    DAC_InitStructure.DAC_Trigger = DAC_Trigger_T6_TRGO;
+    DAC_InitStructure.DAC_WaveGeneration = DAC_WaveGeneration_None;
+    DAC_InitStructure.DAC_OutputBuffer = DAC_OutputBuffer_Enable;
+    DAC_Init(DAC_Channel_1, &DAC_InitStructure);
+
+    DAC_Cmd(DAC_Channel_1, ENABLE);
+    DAC_SetChannel1Data(DAC_Align_12b_R, DACWave_GetMidCode());
+
+    DACWave_ApplyTiming();
+}
+
+void DACWave_Start(void)
+{
+    DACWave_StartTransfer();
     DACWave_Running = 1;
 }
 
 void DACWave_Stop(void)
 {
-    TIM_Cmd(TIM6, DISABLE);
-    DAC_DMACmd(DAC_Channel_1, DISABLE);
-    DMA_Cmd(DMA2_Channel3, DISABLE);
-
-    DAC_SetChannel1Data(DAC_Align_12b_R, DAC_MID_CODE);
-
+    DACWave_StopTransfer();
+    DAC_SetChannel1Data(DAC_Align_12b_R, DACWave_GetMidCode());
     DACWave_Running = 0;
 }
 
 void DACWave_SetFreq(uint32_t freq_hz)
 {
-    DACWave_FreqHz = DACWave_LimitFreq(freq_hz);
-    DACWave_ConfigTIM6(DACWave_FreqHz);
+    freq_hz = DACWave_LimitFreq(freq_hz);
+
+    if (DACWave_FreqHz == freq_hz)
+    {
+        return;
+    }
+
+    DACWave_FreqHz = freq_hz;
+    DACWave_ApplyTiming();
 }
 
 uint32_t DACWave_GetFreq(void)
@@ -375,9 +513,6 @@ void DACWave_SetAmplitudeScale(float scale)
         diff = -diff;
     }
 
-    /*
-     * 幅度变化太小时不更新波表，避免自动调幅稳定后仍反复刷新。
-     */
     if (diff < 0.001f)
     {
         return;
@@ -405,7 +540,7 @@ void DACWave_SetWaveform(Waveform_t waveform)
     }
 
     DACWave_Waveform = waveform;
-    DACWave_UpdateNormTable();
+    DACWave_BuildShapeTable();
     DACWave_UpdateTable();
 }
 
